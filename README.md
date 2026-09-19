@@ -1,68 +1,57 @@
 # bliss-guidance-playcounts
 
-`bliss-guidance-playcounts` is a provider addon for the
-`bliss-playlist-optimizer` guidance SPI. It reads an `lms-play-counts-v1` raw
-snapshot, maps counts to stable candidate identities, and returns bounded global
-preference guidance for each requested candidate. The optimizer applies the
-job's signed play-count influence; this addon does not decide hard eligibility
-or route validity.
+`bliss-guidance-playcounts` is an optional provider for the
+[`bliss-playlist-guidance-spi`](https://github.com/chrober/bliss-playlist-guidance-spi).
+It supplies a small, bounded preference signal based on Lyrion play counts;
+Bliss remains the authority for acoustic similarity, hard eligibility, repeat
+windows, and route validity.
 
-Its SPI provider ID is `playcount-guidance`. It reads a frozen snapshot rather
-than querying LMS directly, so addon execution remains deterministic and
-network-free.
+The provider is started and controlled by `bliss-playlist-optimizer`, not by
+Lyrion directly. Better Call Bliss supplies only trusted, job-owned artifact
+and resource descriptors. It does not export a full-library play-count JSON
+snapshot.
 
-## Data and information flow
+## Data flow
 
 ```mermaid
 flowchart LR
-    S[BlissMixerLab statistics and play-count influence] --> B[Better Call Bliss]
-    D[LMS library database: tracks + tracks_persistent] --> B
-    B -->|capture once for this job| E[lms-play-counts-v1 artifact]
-    I[Frozen candidate inventory and cache identity] --> B
-    B -->|bind snapshot to candidate database identity| E
-    E -->|artifact_path in prepare options| P[bliss-guidance-playcounts]
-    C[Candidate batch] -->|score request| P
-    P -->|global GuidanceSignal| O[Optimizer guidance host]
+    B[Better Call Bliss] -->|eligible candidate identities\nSHA-256-bound artifact| O[bliss-playlist-optimizer]
+    B -->|trusted read-only persist.db resource| O
+    O -->|prepare descriptors| P[bliss-guidance-playcounts]
+    P -->|one read-only SQLite snapshot\ncompact count distribution| P
+    O -->|bounded acoustic shortlist| P
+    P -->|playcount guidance signals| O
+    O -->|guided acoustic ranking + provenance| B
 ```
 
-Better Call Bliss owns the user-facing play-count policy. It reads the enabled
-statistics state and signed play-count influence from the compatible
-BlissMixerLab capability snapshot, then carries the resulting job value in the
-optimizer request. For a job that needs play counts, Better Call Bliss queries
-the LMS `tracks` and `tracks_persistent` tables, maps local URLs to Bliss
-`database_file` identities, yields between batches to keep LMS responsive, and
-writes a frozen `lms-play-counts-v1` artifact. The artifact includes the
-database cache identity and capture time, so it is bound to the same analyzed
-library snapshot as the candidate inventory.
+Better Call Bliss captures the selected virtual-library membership and writes
+the compact `eligible-candidate-identities-v1` artifact. Each record carries a
+stable `candidate_id` and Lyrion `lms_urlmd5`. It also supplies the
+plugin-owned, read-only path to Lyrion's `persist.db`; neither path can come
+from a web-form parameter.
 
-This add-on consumes no LMS database, BlissMixerLab setting, or Better Call
-Bliss setting directly. Its only configuration is the trusted `artifact_path` in
-the SPI `prepare` request. That makes provider execution deterministic and keeps
-LMS database access outside the native route-search process.
+At `prepare`, the provider verifies the identity artifact's SHA-256, opens
+`persist.db` read-only, enables `PRAGMA query_only`, begins one SQLite snapshot,
+and validates `tracks_persistent(urlmd5, playcount)`. It queries the frozen
+eligible identities in batches of at most 900 values and retains only a
+frequency distribution of their counts. Missing rows and null counts are
+treated as zero.
 
-During `prepare`, the add-on reads the artifact once, keeps each candidate's
-count keyed by `database_file`, and converts distinct observed counts to a
-stable percentile. Missing counts are represented as zero for ordering, matching
-the existing optimizer contract. For `score`, it returns a global signal for
-each requested candidate present in the snapshot: the lowest percentile maps to
-`-1`, the highest to `+1`, and intermediate counts map linearly between them.
-The signed per-job influence determines whether the host would later prefer
-more- or less-played tracks; this provider itself does not choose a direction.
+At `score`, the optimizer sends only its already-admitted acoustic shortlist.
+The provider looks up just that batch's uncached URLMD5 values against the same
+snapshot, caches those values for the rest of the job, and emits `playcount`
+signals in `[-1, 1]`. Equal count values receive the same average-rank
+percentile. The optimizer applies the job's signed influence later, so this
+provider does not decide whether frequently or rarely played tracks are wanted.
 
-The current optimizer host records these signals and diagnostics, but its first
-SPI gate does not yet apply them to route selection. The existing request-level
-play-count contract remains the active compatibility path until shared host-side
-reranking is connected.
+## Failure and performance behavior
 
-The addon communicates through versioned JSONL on stdin/stdout. It is intended
-to be discovered and started by the optimizer, not called directly by LMS.
+The provider performs no network requests and never loads a full
+`urlmd5 -> playcount` library map. SQLite lock, schema, artifact, or I/O
+failures return a provider error for the optimizer to treat as neutral advice;
+the Bliss-only playlist job can continue. `close` releases the read snapshot
+and score cache promptly.
 
-Prepare options:
-
-```json
-{ "artifact_path": "/path/to/play-counts.json" }
-```
-
-Unknown counts are treated as zero for percentile ordering, matching the
-optimizer's current play-count contract. The provider remains network-free and
-does not access the LMS database directly.
+Diagnostics report population size, known and zero counts, distribution size,
+bounded query-batch counts, cache hits, and elapsed time. They do not expose
+private filesystem paths.
