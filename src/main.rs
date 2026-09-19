@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use bliss_playlist_guidance_spi::{
-    encode, ArtifactDescriptor, Candidate, Capability, Diagnostics, GuidanceRequest,
-    GuidanceResponse, GuidanceScope, GuidanceSignal, Manifest, ResourceAccess, ResourceDescriptor,
-    PROTOCOL_NAME, SPI_VERSION,
+    encode, ArtifactDescriptor, Candidate, Capability, ChannelDescriptor, Diagnostics,
+    GuidanceRequest, GuidanceResponse, GuidanceScope, GuidanceSignal, Manifest, ResourceAccess,
+    ResourceDescriptor, PROTOCOL_NAME, SPI_VERSION,
 };
 use rusqlite::{params_from_iter, Connection, OpenFlags};
 use serde::Deserialize;
@@ -54,6 +54,10 @@ impl Provider {
             provider_version: PROVIDER_VERSION.to_owned(),
             protocol: PROTOCOL_NAME.to_owned(),
             capabilities: vec![Capability::GlobalCandidateGuidance],
+            channels: vec![ChannelDescriptor {
+                channel: "playcount".to_owned(),
+                scopes: vec![GuidanceScope::Global],
+            }],
             required_context: vec!["candidate_identity".to_owned()],
             configuration_schema: Some(serde_json::json!({
                 "type": "object",
@@ -572,6 +576,8 @@ mod tests {
             manifest.capabilities,
             vec![Capability::GlobalCandidateGuidance]
         );
+        assert_eq!(manifest.channels[0].channel, "playcount");
+        assert_eq!(manifest.channels[0].scopes, vec![GuidanceScope::Global]);
     }
     #[test]
     fn sqlite_snapshot_scores_zero_and_absent_counts_equally() {
