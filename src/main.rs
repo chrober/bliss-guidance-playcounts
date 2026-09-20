@@ -362,8 +362,7 @@ fn query_counts(
         .into_iter()
         .collect();
     for batch in unique.chunks(SQLITE_BATCH_LIMIT) {
-        let placeholders = std::iter::repeat("?")
-            .take(batch.len())
+        let placeholders = std::iter::repeat_n("?", batch.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
