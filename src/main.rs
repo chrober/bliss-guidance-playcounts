@@ -115,29 +115,39 @@ impl Provider {
         validate_tracks_persistent(&connection)?;
 
         let started = Instant::now();
-        let urlmd5s: Vec<String> = identities
-            .candidates
-            .iter()
-            .filter_map(|identity| identity.lms_urlmd5.clone())
-            .filter(|urlmd5| !urlmd5.trim().is_empty())
-            .collect();
-        let lookup = query_counts(&connection, &urlmd5s)?;
         let mut distribution = BTreeMap::new();
         let mut known_count = 0_u64;
         let mut zero_count = 0_u64;
-        for urlmd5 in &urlmd5s {
-            let count = lookup.get(urlmd5).copied().unwrap_or(0);
-            if lookup.contains_key(urlmd5) {
-                known_count += 1;
+        let mut prepare_query_batches = 0_u64;
+        let mut max_prepare_lookup_batch = 0_usize;
+        for identities_batch in identities.candidates.chunks(SQLITE_BATCH_LIMIT) {
+            let urlmd5s: Vec<String> = identities_batch
+                .iter()
+                .filter_map(|identity| identity.lms_urlmd5.clone())
+                .filter(|urlmd5| !urlmd5.trim().is_empty())
+                .collect();
+            max_prepare_lookup_batch = max_prepare_lookup_batch.max(urlmd5s.len());
+            prepare_query_batches += batch_count(urlmd5s.len());
+            let lookup = query_counts(&connection, &urlmd5s)?;
+            for identity in identities_batch {
+                let Some(urlmd5) = identity
+                    .lms_urlmd5
+                    .as_deref()
+                    .filter(|urlmd5| !urlmd5.trim().is_empty())
+                else {
+                    zero_count += 1;
+                    *distribution.entry(0).or_insert(0) += 1;
+                    continue;
+                };
+                let count = lookup.get(urlmd5).copied().unwrap_or(0);
+                if lookup.contains_key(urlmd5) {
+                    known_count += 1;
+                }
+                if count == 0 {
+                    zero_count += 1;
+                }
+                *distribution.entry(count).or_insert(0) += 1;
             }
-            if count == 0 {
-                zero_count += 1;
-            }
-            *distribution.entry(count).or_insert(0) += 1;
-        }
-        for _ in urlmd5s.len()..identities.candidates.len() {
-            zero_count += 1;
-            *distribution.entry(0).or_insert(0) += 1;
         }
 
         let eligible_count = identities.candidates.len() as u64;
@@ -164,7 +174,8 @@ impl Provider {
                     "known_counts": known_count,
                     "zero_counts": zero_count,
                     "distinct_play_counts": self.distribution.len(),
-                    "prepare_query_batches": batch_count(urlmd5s.len()),
+                    "prepare_query_batches": prepare_query_batches,
+                    "max_prepare_lookup_batch": max_prepare_lookup_batch,
                     "elapsed_ms": started.elapsed().as_millis(),
                 })),
             },
@@ -582,6 +593,29 @@ mod tests {
         };
         (path, descriptor)
     }
+    fn large_identity_artifact(count: usize) -> (PathBuf, ArtifactDescriptor) {
+        let path = fixture_path("json");
+        let candidates = (0..count)
+            .map(|index| {
+                serde_json::json!({
+                    "candidate_id": format!("candidate-{index:06}"),
+                    "lms_urlmd5": format!("url-{index:06}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "schema_identity": "eligible-candidate-identities-v1",
+            "candidates": candidates,
+        });
+        fs::write(&path, serde_json::to_vec(&payload).unwrap()).unwrap();
+        let descriptor = ArtifactDescriptor {
+            kind: "eligible-candidate-identities-v1".to_owned(),
+            path: path.display().to_string(),
+            sha256: sha256(&path),
+        };
+        (path, descriptor)
+    }
     fn persist_resource(path: &Path) -> ResourceDescriptor {
         ResourceDescriptor {
             kind: "lms-persist-sqlite-v1".to_owned(),
@@ -683,6 +717,39 @@ mod tests {
             .prepare(&[descriptor], &[persist_resource(&database)])
             .unwrap_err();
         assert!(error.contains("tracks_persistent"));
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn preparation_streams_a_200k_identity_population_in_bounded_batches() {
+        let database = fixture_database(&[]);
+        let (artifact, descriptor) = large_identity_artifact(200_000);
+        let mut provider = Provider::default();
+        let (_, diagnostics) = provider
+            .prepare(&[descriptor], &[persist_resource(&database)])
+            .unwrap();
+        let details = diagnostics.details.expect("preparation diagnostics");
+        assert_eq!(details["eligible_candidates"].as_u64(), Some(200_000));
+        assert!(
+            details["max_prepare_lookup_batch"]
+                .as_u64()
+                .expect("bounded batch telemetry")
+                <= SQLITE_BATCH_LIMIT as u64
+        );
+        assert!(provider.cached_counts.is_empty());
+
+        let first = provider.score("first", &[candidate("candidate-000000", "url-000000")]);
+        let second = provider.score("second", &[candidate("candidate-000000", "url-000000")]);
+        assert!(matches!(first, GuidanceResponse::Scores { signals, .. } if signals.len() == 1));
+        let GuidanceResponse::Scores { diagnostics, .. } = second else {
+            panic!("expected cached score response");
+        };
+        assert_eq!(
+            diagnostics.details.expect("score diagnostics")["cache_hits"].as_u64(),
+            Some(1),
+        );
+
         let _ = fs::remove_file(artifact);
         let _ = fs::remove_file(database);
     }

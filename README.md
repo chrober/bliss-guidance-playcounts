@@ -32,10 +32,11 @@ from a web-form parameter.
 
 At `prepare`, the provider verifies the identity artifact's SHA-256, opens
 `persist.db` read-only, enables `PRAGMA query_only`, begins one SQLite snapshot,
-and validates `tracks_persistent(urlmd5, playcount)`. It queries the frozen
-eligible identities in batches of at most 900 values and retains only a
-frequency distribution of their counts. Missing rows and null counts are
-treated as zero.
+and validates `tracks_persistent(urlmd5, playcount)`. It streams the frozen
+eligible identities through batches of at most 900 values; a batch lookup is
+discarded before the next batch. It retains only a frequency distribution of
+their counts, never a whole-library `urlmd5 -> playcount` map. Missing rows and
+null counts are treated as zero.
 
 At `score`, the optimizer sends only its already-admitted acoustic shortlist.
 The provider looks up just that batch's uncached URLMD5 values against the same
@@ -53,5 +54,7 @@ the Bliss-only playlist job can continue. `close` releases the read snapshot
 and score cache promptly.
 
 Diagnostics report population size, known and zero counts, distribution size,
-bounded query-batch counts, cache hits, and elapsed time. They do not expose
-private filesystem paths.
+the largest preparation lookup batch, bounded query-batch counts, cache hits,
+and elapsed time. A generated 200,000-identity regression fixture verifies the
+bounded preparation path and score-cache reuse without committing a large test
+asset. Diagnostics do not expose private filesystem paths.
