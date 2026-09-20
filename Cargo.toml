@@ -8,7 +8,7 @@ repository = "https://github.com/chrober/bliss-guidance-playcounts"
 publish = false
 
 [dependencies]
-bliss-playlist-guidance-spi = { git = "https://github.com/chrober/bliss-playlist-guidance-spi.git", rev = "ec385df" }
+bliss-playlist-guidance-spi = { git = "https://github.com/chrober/bliss-playlist-guidance-spi.git", rev = "6fa2d55" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
