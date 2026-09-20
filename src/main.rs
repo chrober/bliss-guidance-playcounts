@@ -15,7 +15,18 @@ use std::time::{Duration, Instant};
 
 const PROVIDER_ID: &str = "playcount-guidance";
 const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const PROGRAM: &str = env!("CARGO_PKG_NAME");
 const SQLITE_BATCH_LIMIT: usize = 900;
+
+fn version_metadata_json() -> String {
+    format!(
+        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{PROVIDER_VERSION}\",\"provider_id\":\"{PROVIDER_ID}\",\"spi_version\":{SPI_VERSION}}}"
+    )
+}
+
+fn usage() -> &'static str {
+    "Usage:\n  bliss-guidance-playcounts version [--json]\n  bliss-guidance-playcounts"
+}
 
 #[derive(Debug, Deserialize)]
 struct IdentityArtifact {
@@ -453,6 +464,22 @@ fn unsupported_version() -> GuidanceResponse {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.as_slice() {
+        [] => {}
+        [command] if command == "version" => {
+            println!("{PROGRAM} {PROVIDER_VERSION}");
+            return;
+        }
+        [command, format] if command == "version" && format == "--json" => {
+            println!("{}", version_metadata_json());
+            return;
+        }
+        _ => {
+            eprintln!("{}", usage());
+            std::process::exit(2);
+        }
+    }
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());
     let mut provider = Provider::default();
@@ -500,6 +527,14 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn version_metadata_identifies_playcount_provider_and_spi() {
+        let metadata = version_metadata_json();
+        assert!(metadata.contains("\"program\":\"bliss-guidance-playcounts\""));
+        assert!(metadata.contains("\"provider_id\":\"playcount-guidance\""));
+        assert!(metadata.contains("\"spi_version\":"));
+    }
     fn fixture_path(extension: &str) -> PathBuf {
         let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
