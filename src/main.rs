@@ -364,8 +364,12 @@ fn validate_tracks_persistent(connection: &Connection) -> Result<(), String> {
         .map_err(|error| format!("cannot read tracks_persistent columns: {error}"))?
         .collect::<Result<BTreeSet<_>, _>>()
         .map_err(|error| format!("cannot decode tracks_persistent columns: {error}"))?;
+    let normalized_columns = columns
+        .iter()
+        .map(|column| column.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
     for column in ["urlmd5", "playcount"] {
-        if !columns.contains(column) {
+        if !normalized_columns.contains(column) {
             return Err(format!("tracks_persistent.{column} column is unavailable"));
         }
     }
@@ -548,8 +552,12 @@ mod tests {
     }
     fn fixture_path(extension: &str) -> PathBuf {
         let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
         std::env::temp_dir().join(format!(
-            "bliss-guidance-playcounts-{}-{sequence}.{extension}",
+            "bliss-guidance-playcounts-{}-{timestamp}-{sequence}.{extension}",
             std::process::id()
         ))
     }
@@ -666,6 +674,36 @@ mod tests {
         assert!(
             score(&mut provider, "zero", "zero") < score(&mut provider, "favorite", "favorite")
         );
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(database);
+    }
+
+    #[test]
+    fn accepts_lyrion_camel_case_play_count_column() {
+        let database = fixture_path("sqlite");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE tracks_persistent (urlmd5 TEXT PRIMARY KEY, playCount INTEGER);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO tracks_persistent(urlmd5, playCount) VALUES (?1, ?2)",
+                params!["favorite", 10],
+            )
+            .unwrap();
+        let (artifact, descriptor) =
+            identity_artifact(&[("zero", "zero"), ("favorite", "favorite")]);
+        let mut provider = Provider::default();
+
+        provider
+            .prepare(&[descriptor], &[persist_resource(&database)])
+            .expect("Lyrion's playCount column must be accepted");
+        assert!(
+            score(&mut provider, "zero", "zero") < score(&mut provider, "favorite", "favorite")
+        );
+
         let _ = fs::remove_file(artifact);
         let _ = fs::remove_file(database);
     }
