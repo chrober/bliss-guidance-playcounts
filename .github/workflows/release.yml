@@ -1,0 +1,153 @@
+name: Publish play-count guidance provider
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version. Empty reads Cargo.toml package.version."
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark the GitHub release as prerelease."
+        type: boolean
+        required: true
+        default: false
+      dry_run:
+        description: "Build and upload workflow artifacts only; do not create a GitHub release."
+        type: boolean
+        required: true
+        default: false
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: bliss-guidance-playcounts-x86_64-linux
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: bliss-guidance-playcounts
+            cross: false
+          - asset: bliss-guidance-playcounts-aarch64-linux
+            runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            binary: bliss-guidance-playcounts
+            cross: true
+          - asset: bliss-guidance-playcounts-armhf-linux
+            runner: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            binary: bliss-guidance-playcounts
+            cross: true
+          - asset: bliss-guidance-playcounts-mac
+            runner: macos-latest
+            target: x86_64-apple-darwin
+            binary: bliss-guidance-playcounts
+            cross: false
+          - asset: bliss-guidance-playcounts-windows.exe
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: bliss-guidance-playcounts.exe
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install pinned cross toolchain
+        if: ${{ matrix.cross }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cross.tar.gz"
+          curl --fail --location --retry 3 --output "$archive" \
+            https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz
+          echo "642375d1bcf3bd88272c32ba90e999f3d983050adf45e66bd2d3887e8e838bad  $archive" | sha256sum --check
+          tar --extract --gzip --file "$archive" --directory "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Build release binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          USE_CROSS: ${{ matrix.cross }}
+        run: |
+          set -euo pipefail
+          if [ "$USE_CROSS" = true ]; then
+            cross build --release --locked --target "$TARGET"
+          else
+            cargo build --release --locked --target "$TARGET"
+          fi
+      - name: Stage release asset
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/$TARGET/release/$BINARY" "dist/$ASSET"
+          if [[ "$ASSET" != *.exe ]]; then chmod 0755 "dist/$ASSET"; fi
+          (cd dist && sha256sum "$ASSET" > "$ASSET.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Derive release metadata
+        id: meta
+        env:
+          VERSION_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+        run: |
+          set -euo pipefail
+          version="$VERSION_INPUT"
+          if [ -z "$version" ]; then
+            if [[ "$GITHUB_REF" == refs/tags/* ]]; then version="${GITHUB_REF_NAME#v}"; else version="$(python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))["package"]["version"])')"; fi
+          fi
+          test -n "$version"
+          echo "version=${version#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version#v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bliss-guidance-playcounts-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+        run: |
+          set -euo pipefail
+          printf '# bliss-guidance-playcounts %s\n\nNative guidance-provider binaries for Better Call Bliss.\n\nBuilt from commit %s after fmt, clippy, and test gates.\n' "$VERSION" "$GITHUB_SHA" > release-notes.md
+          prerelease_flag=()
+          if [ "$PRERELEASE" = true ]; then prerelease_flag=(--prerelease); fi
+          if gh release view "$TAG" >/dev/null 2>&1; then gh release upload "$TAG" release-assets/* --clobber; else gh release create "$TAG" release-assets/* --title "bliss-guidance-playcounts $VERSION" --notes-file release-notes.md "${prerelease_flag[@]}"; fi
