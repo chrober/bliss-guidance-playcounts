@@ -1,6 +1,6 @@
 [package]
 name = "bliss-guidance-playcounts"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Guidance addon supplying LMS play-count preferences to Bliss playlist optimization"

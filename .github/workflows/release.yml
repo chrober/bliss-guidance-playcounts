@@ -150,4 +150,4 @@ jobs:
           printf '# bliss-guidance-playcounts %s\n\nNative guidance-provider binaries for Better Call Bliss.\n\nBuilt from commit %s after fmt, clippy, and test gates.\n' "$VERSION" "$GITHUB_SHA" > release-notes.md
           prerelease_flag=()
           if [ "$PRERELEASE" = true ]; then prerelease_flag=(--prerelease); fi
-          if gh release view "$TAG" >/dev/null 2>&1; then gh release upload "$TAG" release-assets/* --clobber; else gh release create "$TAG" release-assets/* --title "bliss-guidance-playcounts $VERSION" --notes-file release-notes.md "${prerelease_flag[@]}"; fi
+          if gh release view "$TAG" >/dev/null 2>&1; then gh release upload "$TAG" release-assets/* --clobber; else gh release create "$TAG" release-assets/* --target "$GITHUB_SHA" --title "bliss-guidance-playcounts $VERSION" --notes-file release-notes.md "${prerelease_flag[@]}"; fi
