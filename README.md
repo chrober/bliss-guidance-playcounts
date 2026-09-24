@@ -6,6 +6,8 @@ It supplies a small, bounded preference signal based on Lyrion play counts;
 Bliss remains the authority for acoustic similarity, hard eligibility, repeat
 windows, and route validity.
 
+That repository is the canonical host-neutral JSONL contract for this provider.
+
 The provider is started and controlled by `bliss-playlist-optimizer`, not by
 Lyrion directly. Better Call Bliss supplies only trusted, job-owned artifact
 and resource descriptors. It does not export a full-library play-count JSON
