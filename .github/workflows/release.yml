@@ -1,4 +1,4 @@
-name: Publish play-count guidance provider
+name: Publish local library-signals guidance provider
 
 on:
   workflow_dispatch:
@@ -45,30 +45,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - asset: bliss-guidance-playcounts-x86_64-linux
+          - asset: bliss-guidance-library-signals-x86_64-linux
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            binary: bliss-guidance-playcounts
+            binary: bliss-guidance-library-signals
             cross: false
-          - asset: bliss-guidance-playcounts-aarch64-linux
+          - asset: bliss-guidance-library-signals-aarch64-linux
             runner: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            binary: bliss-guidance-playcounts
+            binary: bliss-guidance-library-signals
             cross: true
-          - asset: bliss-guidance-playcounts-armhf-linux
+          - asset: bliss-guidance-library-signals-armhf-linux
             runner: ubuntu-latest
             target: armv7-unknown-linux-gnueabihf
-            binary: bliss-guidance-playcounts
+            binary: bliss-guidance-library-signals
             cross: true
-          - asset: bliss-guidance-playcounts-mac
+          - asset: bliss-guidance-library-signals-mac
             runner: macos-latest
             target: x86_64-apple-darwin
-            binary: bliss-guidance-playcounts
+            binary: bliss-guidance-library-signals
             cross: false
-          - asset: bliss-guidance-playcounts-windows.exe
+          - asset: bliss-guidance-library-signals-windows.exe
             runner: windows-latest
             target: x86_64-pc-windows-msvc
-            binary: bliss-guidance-playcounts.exe
+            binary: bliss-guidance-library-signals.exe
             cross: false
     steps:
       - uses: actions/checkout@v4
@@ -136,7 +136,7 @@ jobs:
           echo "tag=v${version#v}" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
-          pattern: bliss-guidance-playcounts-*
+          pattern: bliss-guidance-library-signals-*
           path: release-assets
           merge-multiple: true
       - name: Publish GitHub release
@@ -147,7 +147,7 @@ jobs:
           PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
         run: |
           set -euo pipefail
-          printf '# bliss-guidance-playcounts %s\n\nNative guidance-provider binaries for Better Call Bliss.\n\nBuilt from commit %s after fmt, clippy, and test gates.\n' "$VERSION" "$GITHUB_SHA" > release-notes.md
+          printf '# bliss-guidance-library-signals %s\n\nNative local-library guidance-provider binaries for Better Call Bliss.\n\nBuilt from commit %s after fmt, clippy, and test gates.\n' "$VERSION" "$GITHUB_SHA" > release-notes.md
           prerelease_flag=()
           if [ "$PRERELEASE" = true ]; then prerelease_flag=(--prerelease); fi
-          if gh release view "$TAG" >/dev/null 2>&1; then gh release upload "$TAG" release-assets/* --clobber; else gh release create "$TAG" release-assets/* --target "$GITHUB_SHA" --title "bliss-guidance-playcounts $VERSION" --notes-file release-notes.md "${prerelease_flag[@]}"; fi
+          if gh release view "$TAG" >/dev/null 2>&1; then gh release upload "$TAG" release-assets/* --clobber; else gh release create "$TAG" release-assets/* --target "$GITHUB_SHA" --title "bliss-guidance-library-signals $VERSION" --notes-file release-notes.md "${prerelease_flag[@]}"; fi

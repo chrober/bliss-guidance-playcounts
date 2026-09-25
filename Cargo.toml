@@ -1,10 +1,10 @@
 [package]
-name = "bliss-guidance-playcounts"
-version = "0.1.1"
+name = "bliss-guidance-library-signals"
+version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
-description = "Guidance addon supplying LMS play-count preferences to Bliss playlist optimization"
-repository = "https://github.com/chrober/bliss-guidance-playcounts"
+description = "Guidance addon supplying Lyrion listening and library signals to Bliss playlist optimization"
+repository = "https://github.com/chrober/bliss-guidance-library-signals"
 publish = false
 
 [dependencies]

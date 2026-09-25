@@ -13,7 +13,7 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::time::{Duration, Instant};
 
-const PROVIDER_ID: &str = "playcount-guidance";
+const PROVIDER_ID: &str = "library-signals-guidance";
 const PROVIDER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROGRAM: &str = env!("CARGO_PKG_NAME");
 const SQLITE_BATCH_LIMIT: usize = 900;
@@ -25,7 +25,7 @@ fn version_metadata_json() -> String {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  bliss-guidance-playcounts version [--json]\n  bliss-guidance-playcounts"
+    "Usage:\n  bliss-guidance-library-signals version [--json]\n  bliss-guidance-library-signals"
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,14 +42,55 @@ struct CandidateIdentity {
     lms_urlmd5: Option<String>,
 }
 
+#[derive(Clone, Default)]
+struct LocalSignals {
+    playcount: u64,
+    /// A null or zero value means that Lyrion has not recorded a play yet.
+    last_played: u64,
+    /// `added` is nullable in Lyrion's persist database.  A missing value is
+    /// deliberately neutral rather than being guessed as either old or new.
+    library_age: Option<u64>,
+}
+
 #[derive(Default)]
-struct Provider {
-    connection: Option<Connection>,
-    distribution: BTreeMap<u64, u64>,
-    eligible_count: u64,
+struct SignalDistribution {
+    frequencies: BTreeMap<u64, u64>,
     known_count: u64,
     zero_count: u64,
-    cached_counts: HashMap<String, u64>,
+}
+
+impl SignalDistribution {
+    fn record(&mut self, value: u64) {
+        *self.frequencies.entry(value).or_insert(0) += 1;
+        self.known_count += 1;
+        if value == 0 {
+            self.zero_count += 1;
+        }
+    }
+
+    fn percentile(&self, value: u64) -> f64 {
+        if self.known_count <= 1 {
+            return 0.0;
+        }
+        let lower: u64 = self
+            .frequencies
+            .range(..value)
+            .map(|(_, frequency)| *frequency)
+            .sum();
+        let tied = self.frequencies.get(&value).copied().unwrap_or(0);
+        let average_rank = lower as f64 + (tied.saturating_sub(1) as f64 / 2.0);
+        (average_rank / (self.known_count - 1) as f64).clamp(0.0, 1.0)
+    }
+}
+
+#[derive(Default)]
+struct LibrarySignalsState {
+    connection: Option<Connection>,
+    playcount: SignalDistribution,
+    last_played: SignalDistribution,
+    library_age: SignalDistribution,
+    eligible_count: u64,
+    cached_signals: HashMap<String, Option<LocalSignals>>,
     score_batches: u64,
     score_query_batches: u64,
     score_cache_hits: u64,
@@ -57,7 +98,7 @@ struct Provider {
     prepared: bool,
 }
 
-impl Provider {
+impl LibrarySignalsState {
     fn manifest() -> Manifest {
         Manifest {
             spi_version: SPI_VERSION,
@@ -65,10 +106,20 @@ impl Provider {
             provider_version: PROVIDER_VERSION.to_owned(),
             protocol: PROTOCOL_NAME.to_owned(),
             capabilities: vec![Capability::GlobalCandidateGuidance],
-            channels: vec![ChannelDescriptor {
-                channel: "playcount".to_owned(),
-                scopes: vec![GuidanceScope::Global],
-            }],
+            channels: vec![
+                ChannelDescriptor {
+                    channel: "playcount".to_owned(),
+                    scopes: vec![GuidanceScope::Global],
+                },
+                ChannelDescriptor {
+                    channel: "last_played".to_owned(),
+                    scopes: vec![GuidanceScope::Global],
+                },
+                ChannelDescriptor {
+                    channel: "library_age".to_owned(),
+                    scopes: vec![GuidanceScope::Global],
+                },
+            ],
             required_context: vec!["candidate_identity".to_owned()],
             configuration_schema: Some(serde_json::json!({
                 "type": "object",
@@ -115,9 +166,9 @@ impl Provider {
         validate_tracks_persistent(&connection)?;
 
         let started = Instant::now();
-        let mut distribution = BTreeMap::new();
-        let mut known_count = 0_u64;
-        let mut zero_count = 0_u64;
+        let mut playcount = SignalDistribution::default();
+        let mut last_played = SignalDistribution::default();
+        let mut library_age = SignalDistribution::default();
         let mut prepare_query_batches = 0_u64;
         let mut max_prepare_lookup_batch = 0_usize;
         for identities_batch in identities.candidates.chunks(SQLITE_BATCH_LIMIT) {
@@ -128,25 +179,25 @@ impl Provider {
                 .collect();
             max_prepare_lookup_batch = max_prepare_lookup_batch.max(urlmd5s.len());
             prepare_query_batches += batch_count(urlmd5s.len());
-            let lookup = query_counts(&connection, &urlmd5s)?;
+            let lookup = query_local_signals(&connection, &urlmd5s)?;
             for identity in identities_batch {
                 let Some(urlmd5) = identity
                     .lms_urlmd5
                     .as_deref()
                     .filter(|urlmd5| !urlmd5.trim().is_empty())
                 else {
-                    zero_count += 1;
-                    *distribution.entry(0).or_insert(0) += 1;
                     continue;
                 };
-                let count = lookup.get(urlmd5).copied().unwrap_or(0);
-                if lookup.contains_key(urlmd5) {
-                    known_count += 1;
+                let Some(signals) = lookup.get(urlmd5) else {
+                    // This identity is not represented by the stable Lyrion
+                    // persistence database. Do not fabricate a ranking.
+                    continue;
+                };
+                playcount.record(signals.playcount);
+                last_played.record(signals.last_played);
+                if let Some(added) = signals.library_age {
+                    library_age.record(added);
                 }
-                if count == 0 {
-                    zero_count += 1;
-                }
-                *distribution.entry(count).or_insert(0) += 1;
             }
         }
 
@@ -157,10 +208,10 @@ impl Provider {
             eligible_count
         );
         self.connection = Some(connection);
-        self.distribution = distribution;
+        self.playcount = playcount;
+        self.last_played = last_played;
+        self.library_age = library_age;
         self.eligible_count = eligible_count;
-        self.known_count = known_count;
-        self.zero_count = zero_count;
         self.snapshot_id = Some(snapshot_id.clone());
         self.prepared = true;
         Ok((
@@ -171,9 +222,14 @@ impl Provider {
                 failure_count: 0,
                 details: Some(serde_json::json!({
                     "eligible_candidates": eligible_count,
-                    "known_counts": known_count,
-                    "zero_counts": zero_count,
-                    "distinct_play_counts": self.distribution.len(),
+                    "known_playcounts": self.playcount.known_count,
+                    "zero_playcounts": self.playcount.zero_count,
+                    "known_last_played": self.last_played.known_count,
+                    "never_played": self.last_played.zero_count,
+                    "known_library_age": self.library_age.known_count,
+                    "distinct_playcounts": self.playcount.frequencies.len(),
+                    "distinct_last_played": self.last_played.frequencies.len(),
+                    "distinct_library_age": self.library_age.frequencies.len(),
                     "prepare_query_batches": prepare_query_batches,
                     "max_prepare_lookup_batch": max_prepare_lookup_batch,
                     "elapsed_ms": started.elapsed().as_millis(),
@@ -207,11 +263,11 @@ impl Provider {
             .collect();
         let uncached: Vec<String> = urls
             .iter()
-            .filter(|urlmd5| !self.cached_counts.contains_key(*urlmd5))
+            .filter(|urlmd5| !self.cached_signals.contains_key(*urlmd5))
             .cloned()
             .collect();
         let cache_hits = urls.len().saturating_sub(uncached.len()) as u64;
-        let fetched = match query_counts(connection, &uncached) {
+        let fetched = match query_local_signals(connection, &uncached) {
             Ok(fetched) => fetched,
             Err(message) => {
                 return GuidanceResponse::Error {
@@ -223,29 +279,63 @@ impl Provider {
             }
         };
         for urlmd5 in &uncached {
-            self.cached_counts
-                .insert(urlmd5.clone(), fetched.get(urlmd5).copied().unwrap_or(0));
+            self.cached_signals
+                .insert(urlmd5.clone(), fetched.get(urlmd5).cloned());
         }
 
         let signals: Vec<GuidanceSignal> = candidates
             .iter()
             .filter_map(|candidate| {
                 let urlmd5 = candidate.lms_urlmd5.as_ref()?;
-                let count = self.cached_counts.get(urlmd5).copied().unwrap_or(0);
-                let percentile = self.percentile(count);
-                Some(
+                let values = self.cached_signals.get(urlmd5).and_then(Option::as_ref)?;
+                let mut signals = vec![
                     GuidanceSignal {
                         candidate_id: candidate.candidate_id.clone(),
                         channel: "playcount".to_owned(),
                         scope: GuidanceScope::Global,
-                        score: (2.0 * percentile - 1.0).clamp(-1.0, 1.0),
+                        score: centered_percentile(self.playcount.percentile(values.playcount)),
                         confidence: 1.0,
-                        rationale: Some(format!("LMS play-count percentile {percentile:.3}")),
+                        rationale: Some(format!(
+                            "Lyrion play-count percentile {:.3}",
+                            self.playcount.percentile(values.playcount)
+                        )),
                         observed_at: None,
                     }
                     .bounded(),
-                )
+                    GuidanceSignal {
+                        candidate_id: candidate.candidate_id.clone(),
+                        channel: "last_played".to_owned(),
+                        scope: GuidanceScope::Global,
+                        score: centered_percentile(self.last_played.percentile(values.last_played)),
+                        confidence: 1.0,
+                        rationale: Some(format!(
+                            "Lyrion last-played recency percentile {:.3}",
+                            self.last_played.percentile(values.last_played)
+                        )),
+                        observed_at: None,
+                    }
+                    .bounded(),
+                ];
+                if let Some(added) = values.library_age {
+                    signals.push(
+                        GuidanceSignal {
+                            candidate_id: candidate.candidate_id.clone(),
+                            channel: "library_age".to_owned(),
+                            scope: GuidanceScope::Global,
+                            score: centered_percentile(self.library_age.percentile(added)),
+                            confidence: 1.0,
+                            rationale: Some(format!(
+                                "Lyrion first-seen library-age percentile {:.3}",
+                                self.library_age.percentile(added)
+                            )),
+                            observed_at: None,
+                        }
+                        .bounded(),
+                    );
+                }
+                Some(signals)
             })
+            .flatten()
             .collect();
         self.score_batches += 1;
         self.score_query_batches += batch_count(uncached.len());
@@ -260,9 +350,9 @@ impl Provider {
                 failure_count: 0,
                 details: Some(serde_json::json!({
                     "eligible_candidates": self.eligible_count,
-                    "known_counts": self.known_count,
-                    "zero_counts": self.zero_count,
-                    "distribution_size": self.distribution.len(),
+                    "known_playcounts": self.playcount.known_count,
+                    "known_last_played": self.last_played.known_count,
+                    "known_library_age": self.library_age.known_count,
                     "query_batches": batch_count(uncached.len()),
                     "cache_hits": cache_hits,
                     "total_score_batches": self.score_batches,
@@ -274,29 +364,15 @@ impl Provider {
         }
     }
 
-    fn percentile(&self, count: u64) -> f64 {
-        if self.eligible_count <= 1 {
-            return 0.0;
-        }
-        let lower: u64 = self
-            .distribution
-            .range(..count)
-            .map(|(_, frequency)| *frequency)
-            .sum();
-        let tied = self.distribution.get(&count).copied().unwrap_or(0);
-        let average_rank = lower as f64 + (tied.saturating_sub(1) as f64 / 2.0);
-        (average_rank / (self.eligible_count - 1) as f64).clamp(0.0, 1.0)
-    }
-
     fn reset(&mut self) {
         if let Some(connection) = self.connection.take() {
             let _ = connection.execute_batch("ROLLBACK;");
         }
-        self.distribution.clear();
-        self.cached_counts.clear();
+        self.playcount = SignalDistribution::default();
+        self.last_played = SignalDistribution::default();
+        self.library_age = SignalDistribution::default();
+        self.cached_signals.clear();
         self.eligible_count = 0;
-        self.known_count = 0;
-        self.zero_count = 0;
         self.score_batches = 0;
         self.score_query_batches = 0;
         self.score_cache_hits = 0;
@@ -368,7 +444,7 @@ fn validate_tracks_persistent(connection: &Connection) -> Result<(), String> {
         .iter()
         .map(|column| column.to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
-    for column in ["urlmd5", "playcount"] {
+    for column in ["urlmd5", "playcount", "lastplayed", "added"] {
         if !normalized_columns.contains(column) {
             return Err(format!("tracks_persistent.{column} column is unavailable"));
         }
@@ -376,10 +452,14 @@ fn validate_tracks_persistent(connection: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-fn query_counts(
+fn centered_percentile(percentile: f64) -> f64 {
+    (2.0 * percentile - 1.0).clamp(-1.0, 1.0)
+}
+
+fn query_local_signals(
     connection: &Connection,
     urlmd5s: &[String],
-) -> Result<HashMap<String, u64>, String> {
+) -> Result<HashMap<String, LocalSignals>, String> {
     let mut result = HashMap::new();
     let unique: Vec<String> = urlmd5s
         .iter()
@@ -392,21 +472,31 @@ fn query_counts(
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT urlmd5, playcount FROM tracks_persistent WHERE urlmd5 IN ({placeholders})"
+            "SELECT urlmd5, playCount, lastPlayed, added FROM tracks_persistent WHERE urlmd5 IN ({placeholders})"
         );
         let mut statement = connection
             .prepare(&sql)
-            .map_err(|error| format!("cannot prepare play-count query: {error}"))?;
+            .map_err(|error| format!("cannot prepare Lyrion library-signal query: {error}"))?;
         let rows = statement
             .query_map(params_from_iter(batch.iter()), |row| {
-                let count = row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0) as u64;
-                Ok((row.get::<_, String>(0)?, count))
+                let non_negative = |index| -> rusqlite::Result<Option<u64>> {
+                    row.get::<_, Option<i64>>(index)
+                        .map(|value| value.map(|value| value.max(0) as u64))
+                };
+                Ok((
+                    row.get::<_, String>(0)?,
+                    LocalSignals {
+                        playcount: non_negative(1)?.unwrap_or(0),
+                        last_played: non_negative(2)?.unwrap_or(0),
+                        library_age: non_negative(3)?,
+                    },
+                ))
             })
-            .map_err(|error| format!("cannot query play counts: {error}"))?;
+            .map_err(|error| format!("cannot query Lyrion library signals: {error}"))?;
         for row in rows {
-            let (urlmd5, count) =
-                row.map_err(|error| format!("cannot decode play count: {error}"))?;
-            result.insert(urlmd5, count);
+            let (urlmd5, values) =
+                row.map_err(|error| format!("cannot decode Lyrion library signals: {error}"))?;
+            result.insert(urlmd5, values);
         }
     }
     Ok(result)
@@ -416,11 +506,11 @@ fn batch_count(item_count: usize) -> u64 {
     item_count.div_ceil(SQLITE_BATCH_LIMIT) as u64
 }
 
-fn handle(provider: &mut Provider, request: GuidanceRequest) -> GuidanceResponse {
+fn handle(provider: &mut LibrarySignalsState, request: GuidanceRequest) -> GuidanceResponse {
     match request {
         GuidanceRequest::Describe { spi_version } => {
             if spi_version == SPI_VERSION {
-                GuidanceResponse::Manifest(Provider::manifest())
+                GuidanceResponse::Manifest(LibrarySignalsState::manifest())
             } else {
                 unsupported_version()
             }
@@ -497,7 +587,7 @@ fn main() {
     }
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());
-    let mut provider = Provider::default();
+    let mut provider = LibrarySignalsState::default();
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(line) if !line.trim().is_empty() => line,
@@ -544,10 +634,10 @@ mod tests {
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn version_metadata_identifies_playcount_provider_and_spi() {
+    fn version_metadata_identifies_library_signals_provider_and_spi() {
         let metadata = version_metadata_json();
-        assert!(metadata.contains("\"program\":\"bliss-guidance-playcounts\""));
-        assert!(metadata.contains("\"provider_id\":\"playcount-guidance\""));
+        assert!(metadata.contains("\"program\":\"bliss-guidance-library-signals\""));
+        assert!(metadata.contains("\"provider_id\":\"library-signals-guidance\""));
         assert!(metadata.contains("\"spi_version\":"));
     }
     fn fixture_path(extension: &str) -> PathBuf {
@@ -557,7 +647,7 @@ mod tests {
             .expect("system clock is after the Unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "bliss-guidance-playcounts-{}-{timestamp}-{sequence}.{extension}",
+            "bliss-guidance-library-signals-{}-{timestamp}-{sequence}.{extension}",
             std::process::id()
         ))
     }
@@ -579,12 +669,28 @@ mod tests {
     fn fixture_database(rows: &[(&str, u64)]) -> PathBuf {
         let path = fixture_path("sqlite");
         let connection = Connection::open(&path).unwrap();
-        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE tracks_persistent (urlmd5 TEXT PRIMARY KEY, playcount INTEGER);").unwrap();
+        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE tracks_persistent (urlmd5 TEXT PRIMARY KEY, playCount INTEGER, lastPlayed INTEGER, added INTEGER);").unwrap();
         for (urlmd5, playcount) in rows {
             connection
                 .execute(
-                    "INSERT INTO tracks_persistent(urlmd5, playcount) VALUES (?1, ?2)",
+                    "INSERT INTO tracks_persistent(urlmd5, playCount) VALUES (?1, ?2)",
                     params![urlmd5, playcount],
+                )
+                .unwrap();
+        }
+        path
+    }
+    fn library_signal_fixture_database(rows: &[(&str, u64, Option<u64>, Option<u64>)]) -> PathBuf {
+        let path = fixture_path("sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE tracks_persistent (urlmd5 TEXT PRIMARY KEY, playCount INTEGER, lastPlayed INTEGER, added INTEGER);",
+        ).unwrap();
+        for (urlmd5, playcount, last_played, added) in rows {
+            connection
+                .execute(
+                    "INSERT INTO tracks_persistent(urlmd5, playCount, lastPlayed, added) VALUES (?1, ?2, ?3, ?4)",
+                    params![urlmd5, playcount, last_played, added],
                 )
                 .unwrap();
         }
@@ -631,7 +737,7 @@ mod tests {
             access: ResourceAccess::ReadOnly,
         }
     }
-    fn score(provider: &mut Provider, candidate_id: &str, urlmd5: &str) -> f64 {
+    fn score(provider: &mut LibrarySignalsState, candidate_id: &str, urlmd5: &str) -> f64 {
         match provider.score("score", &[candidate(candidate_id, urlmd5)]) {
             GuidanceResponse::Scores { signals, .. } => {
                 signals
@@ -644,36 +750,94 @@ mod tests {
         }
     }
     #[test]
-    fn manifest_identifies_playcount_guidance_provider() {
-        let manifest = Provider::manifest();
-        assert_eq!(manifest.provider_id, "playcount-guidance");
+    fn manifest_identifies_library_signals_provider() {
+        let manifest = LibrarySignalsState::manifest();
+        assert_eq!(manifest.provider_id, "library-signals-guidance");
         assert_eq!(manifest.protocol, PROTOCOL_NAME);
         assert_eq!(
             manifest.capabilities,
             vec![Capability::GlobalCandidateGuidance]
         );
-        assert_eq!(manifest.channels[0].channel, "playcount");
-        assert_eq!(manifest.channels[0].scopes, vec![GuidanceScope::Global]);
+        assert!(manifest
+            .channels
+            .iter()
+            .all(|channel| channel.scopes == vec![GuidanceScope::Global]));
     }
     #[test]
-    fn sqlite_snapshot_scores_zero_and_absent_counts_equally() {
-        let database = fixture_database(&[("favorite", 10)]);
+    fn manifest_identifies_library_signals_provider_and_all_lyrion_channels() {
+        let manifest = LibrarySignalsState::manifest();
+        assert_eq!(manifest.provider_id, "library-signals-guidance");
+        assert_eq!(
+            manifest
+                .channels
+                .iter()
+                .map(|channel| channel.channel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["playcount", "last_played", "library_age"],
+        );
+    }
+    #[test]
+    fn scores_last_played_and_library_age_monotonically_and_leaves_missing_rows_neutral() {
+        let database = library_signal_fixture_database(&[
+            ("old-unplayed", 0, None, Some(100)),
+            ("recent-new", 12, Some(9_000), Some(9_000)),
+        ]);
+        let (artifact, descriptor) = identity_artifact(&[
+            ("old-unplayed", "old-unplayed"),
+            ("recent-new", "recent-new"),
+            ("missing", "missing"),
+        ]);
+        let mut provider = LibrarySignalsState::default();
+        provider
+            .prepare(&[descriptor], &[persist_resource(&database)])
+            .unwrap();
+        let GuidanceResponse::Scores { signals, .. } = provider.score(
+            "score",
+            &[
+                candidate("old-unplayed", "old-unplayed"),
+                candidate("recent-new", "recent-new"),
+                candidate("missing", "missing"),
+            ],
+        ) else {
+            panic!("expected score response");
+        };
+        let values = signals
+            .into_iter()
+            .map(|signal| ((signal.candidate_id, signal.channel), signal.score))
+            .collect::<BTreeMap<_, _>>();
+        assert!(
+            values[&("old-unplayed".to_owned(), "last_played".to_owned())]
+                < values[&("recent-new".to_owned(), "last_played".to_owned())]
+        );
+        assert!(
+            values[&("old-unplayed".to_owned(), "library_age".to_owned())]
+                < values[&("recent-new".to_owned(), "library_age".to_owned())]
+        );
+        assert!(!values.contains_key(&("missing".to_owned(), "playcount".to_owned())));
+        let _ = fs::remove_file(artifact);
+        let _ = fs::remove_file(database);
+    }
+    #[test]
+    fn sqlite_snapshot_scores_known_zero_and_leaves_absent_rows_neutral() {
+        let database = fixture_database(&[("zero", 0), ("favorite", 10)]);
         let (artifact, descriptor) = identity_artifact(&[
             ("zero", "zero"),
             ("missing", "missing"),
             ("favorite", "favorite"),
         ]);
-        let mut provider = Provider::default();
+        let mut provider = LibrarySignalsState::default();
         provider
             .prepare(&[descriptor], &[persist_resource(&database)])
             .unwrap();
-        assert_eq!(
-            score(&mut provider, "zero", "zero"),
-            score(&mut provider, "missing", "missing")
-        );
         assert!(
             score(&mut provider, "zero", "zero") < score(&mut provider, "favorite", "favorite")
         );
+        let GuidanceResponse::Scores { signals, .. } =
+            provider.score("missing", &[candidate("missing", "missing")])
+        else {
+            panic!("expected score response");
+        };
+        assert!(signals.is_empty());
         let _ = fs::remove_file(artifact);
         let _ = fs::remove_file(database);
     }
@@ -684,7 +848,7 @@ mod tests {
         let connection = Connection::open(&database).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE tracks_persistent (urlmd5 TEXT PRIMARY KEY, playCount INTEGER);",
+                "CREATE TABLE tracks_persistent (urlmd5 TEXT PRIMARY KEY, playCount INTEGER, lastPlayed INTEGER, added INTEGER);",
             )
             .unwrap();
         connection
@@ -693,16 +857,13 @@ mod tests {
                 params!["favorite", 10],
             )
             .unwrap();
-        let (artifact, descriptor) =
-            identity_artifact(&[("zero", "zero"), ("favorite", "favorite")]);
-        let mut provider = Provider::default();
+        let (artifact, descriptor) = identity_artifact(&[("favorite", "favorite")]);
+        let mut provider = LibrarySignalsState::default();
 
         provider
             .prepare(&[descriptor], &[persist_resource(&database)])
             .expect("Lyrion's playCount column must be accepted");
-        assert!(
-            score(&mut provider, "zero", "zero") < score(&mut provider, "favorite", "favorite")
-        );
+        assert_eq!(score(&mut provider, "favorite", "favorite"), -1.0);
 
         let _ = fs::remove_file(artifact);
         let _ = fs::remove_file(database);
@@ -712,7 +873,7 @@ mod tests {
         let database = fixture_database(&[("same-a", 5), ("same-b", 5), ("high", 20)]);
         let (artifact, descriptor) =
             identity_artifact(&[("same-a", "same-a"), ("same-b", "same-b"), ("high", "high")]);
-        let mut provider = Provider::default();
+        let mut provider = LibrarySignalsState::default();
         provider
             .prepare(&[descriptor], &[persist_resource(&database)])
             .unwrap();
@@ -728,7 +889,7 @@ mod tests {
     fn prepared_snapshot_ignores_a_later_external_database_update() {
         let database = fixture_database(&[("song", 1), ("other", 10)]);
         let (artifact, descriptor) = identity_artifact(&[("song", "song"), ("other", "other")]);
-        let mut provider = Provider::default();
+        let mut provider = LibrarySignalsState::default();
         provider
             .prepare(&[descriptor], &[persist_resource(&database)])
             .unwrap();
@@ -751,7 +912,7 @@ mod tests {
         let database = fixture_path("sqlite");
         Connection::open(&database).unwrap();
         let (artifact, descriptor) = identity_artifact(&[("song", "song")]);
-        let error = Provider::default()
+        let error = LibrarySignalsState::default()
             .prepare(&[descriptor], &[persist_resource(&database)])
             .unwrap_err();
         assert!(error.contains("tracks_persistent"));
@@ -761,9 +922,9 @@ mod tests {
 
     #[test]
     fn preparation_streams_a_200k_identity_population_in_bounded_batches() {
-        let database = fixture_database(&[]);
+        let database = fixture_database(&[("url-000000", 0)]);
         let (artifact, descriptor) = large_identity_artifact(200_000);
-        let mut provider = Provider::default();
+        let mut provider = LibrarySignalsState::default();
         let (_, diagnostics) = provider
             .prepare(&[descriptor], &[persist_resource(&database)])
             .unwrap();
@@ -775,11 +936,11 @@ mod tests {
                 .expect("bounded batch telemetry")
                 <= SQLITE_BATCH_LIMIT as u64
         );
-        assert!(provider.cached_counts.is_empty());
+        assert!(provider.cached_signals.is_empty());
 
         let first = provider.score("first", &[candidate("candidate-000000", "url-000000")]);
         let second = provider.score("second", &[candidate("candidate-000000", "url-000000")]);
-        assert!(matches!(first, GuidanceResponse::Scores { signals, .. } if signals.len() == 1));
+        assert!(matches!(first, GuidanceResponse::Scores { signals, .. } if signals.len() == 2));
         let GuidanceResponse::Scores { diagnostics, .. } = second else {
             panic!("expected cached score response");
         };
